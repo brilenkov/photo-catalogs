@@ -2518,16 +2518,24 @@ def main():
 def create_wsgi_app():
     """Создать Flask app для WSGI-серверов (gunicorn, uwsgi).
     Использование: gunicorn 'awards_refs:create_wsgi_app()' --bind 0.0.0.0:$PORT
+    
+    Использует АСИНХРОННУЮ обработку: /collect запускает фоновый поток
+    и возвращает job_id, /status/<job_id> опрашивает прогресс.
+    Это необходимо для хостинга (Render free tier = 30 сек таймаут).
     """
     from flask import Flask, request, jsonify, send_file
     from collections import defaultdict
+    import threading
+    import uuid
     
     app = Flask(__name__)
-    collecting = {"active": False}
     
-    # Встроенный HTML интерфейс
+    # Хранилище задач: job_id → {status, progress, message, files, error}
+    jobs = {}
+    jobs_lock = threading.Lock()
+    
     INDEX_HTML = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>35awards References</title>
+<html><head><meta charset="UTF-8"><title>35awards References Collector</title>
 <style>
 body { background: #0a0a0a; color: #e8e6e3; font-family: -apple-system, sans-serif; padding: 40px; max-width: 900px; margin: 0 auto; }
 h1 { color: #c9a04a; margin-bottom: 8px; }
@@ -2540,6 +2548,8 @@ button:hover { background: #d4a04a; }
 button:disabled { background: #5a5650; cursor: not-allowed; }
 .hint { font-size: 13px; color: #5a5650; margin-top: 6px; }
 .status { margin-top: 20px; padding: 16px; background: #141414; border-radius: 4px; display: none; }
+.progress-bar { margin-top: 10px; height: 6px; background: #222; border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; background: #c9a04a; transition: width 0.5s ease; width: 0%; }
 .checkbox-row { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
 .checkbox-row input { width: auto; }
 .checkbox-row label { margin: 0; cursor: pointer; }
@@ -2553,6 +2563,7 @@ button:disabled { background: #5a5650; cursor: not-allowed; }
 </style></head><body>
 <h1>📸 35awards References Collector</h1>
 <p class="subtitle">Сбор референсов с 35awards.com — победители и финалисты 9 конкурсов (2015—2025)</p>
+
 <form id="form">
 <label>Номинация:</label>
 <select id="query">
@@ -2589,6 +2600,7 @@ button:disabled { background: #5a5650; cursor: not-allowed; }
 <option value="все">Все номинации</option>
 </optgroup>
 </select>
+
 <div class="form-row">
 <div>
 <label>Максимум фото:</label>
@@ -2601,60 +2613,105 @@ button:disabled { background: #5a5650; cursor: not-allowed; }
 <div class="hint">Сколько брать из каждой номинации</div>
 </div>
 </div>
+
 <div class="checkbox-row">
 <input type="checkbox" id="per_nomination">
 <label for="per_nomination">📋 Отдельные каталоги для каждой номинации (плюс общий)</label>
 </div>
 <div class="hint" style="margin-left: 26px;">Каждая номинация получит свой HTML-файл со ВСЕМИ работами</div>
-<label>Доп. фильтр через VLM (опционально):</label>
-<input type="text" id="vlm_filter" placeholder="например: девушка в кадре? (оставьте пустым если не нужно)">
-<div class="hint">Требуется z-ai CLI. Для nude фото цензурируется автоматически.</div>
+
 <button type="submit" id="submitBtn">🚀 Собрать каталог</button>
 </form>
+
 <div class="status" id="status"></div>
 <div class="results" id="results"></div>
+
 <script>
+let pollTimer = null;
+
 document.getElementById('form').onsubmit = async (e) => {
     e.preventDefault();
     const q = document.getElementById('query').value;
     const c = parseInt(document.getElementById('count').value);
     const pn = parseInt(document.getElementById('per_nom').value);
     const perNom = document.getElementById('per_nomination').checked;
-    const vlm = document.getElementById('vlm_filter').value;
+    
     const status = document.getElementById('status');
     const results = document.getElementById('results');
     const btn = document.getElementById('submitBtn');
+    
     btn.disabled = true;
-    btn.textContent = '⏳ Сборка...';
+    btn.textContent = '⏳ Запуск...';
     status.style.display = 'block';
-    status.textContent = '⏳ Запускаю сборку... Это может занять несколько минут...';
+    status.innerHTML = '<div>⏳ Запускаю сборку...</div><div class="progress-bar"><div class="progress-fill" id="pfill"></div></div><div id="pmsg" style="margin-top:8px;font-size:13px;color:#8a8680"></div>';
     results.innerHTML = '';
+    
     try {
+        // Запустить задачу (возвращает job_id мгновенно)
         const resp = await fetch('/collect', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({query: q, count: c, per_nomination: perNom, per_nom: pn, vlm_filter: vlm})
+            body: JSON.stringify({query: q, count: c, per_nomination: perNom, per_nom: pn})
         });
         const data = await resp.json();
-        if (data.success) {
-            status.textContent = '✅ Готово! ' + data.message;
-            let html = '';
-            if (data.files && data.files.length > 0) {
-                html += '<h3 style="color:#c9a04a;margin-top:20px">📂 Каталоги:</h3>';
-                data.files.forEach(f => {
-                    html += '<div class="result-item">';
-                    html += '<a href="' + f.url + '" target="_blank" class="result-link">📄 ' + f.name + '</a>';
-                    html += '<div class="result-meta">' + f.photos + ' фото · ' + f.size + '</div>';
-                    html += '</div>';
-                });
-            }
-            results.innerHTML = html;
-        } else {
-            status.textContent = '❌ Ошибка: ' + data.error;
+        
+        if (!data.success) {
+            status.innerHTML = '❌ Ошибка: ' + data.error;
+            btn.disabled = false;
+            btn.textContent = '🚀 Собрать каталог';
+            return;
         }
+        
+        // Опрашивать статус
+        const jobId = data.job_id;
+        btn.textContent = '⏳ Сборка...';
+        
+        pollTimer = setInterval(async () => {
+            try {
+                const sr = await fetch('/status/' + jobId);
+                const sd = await sr.json();
+                
+                const fill = document.getElementById('pfill');
+                const msg = document.getElementById('pmsg');
+                
+                if (sd.progress !== undefined) {
+                    fill.style.width = sd.progress + '%';
+                }
+                if (sd.message) {
+                    msg.textContent = sd.message;
+                }
+                
+                if (sd.status === 'done') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    btn.disabled = false;
+                    btn.textContent = '🚀 Собрать каталог';
+                    
+                    let html = '<div>✅ ' + sd.message + '</div>';
+                    if (sd.files && sd.files.length > 0) {
+                        html += '<h3 style="color:#c9a04a;margin-top:20px">📂 Каталоги:</h3>';
+                        sd.files.forEach(f => {
+                            html += '<div class="result-item">';
+                            html += '<a href="' + f.url + '" target="_blank" class="result-link">📄 ' + f.name + '</a>';
+                            html += '<div class="result-meta">' + f.photos + ' фото · ' + f.size + '</div>';
+                            html += '</div>';
+                        });
+                    }
+                    results.innerHTML = html;
+                } else if (sd.status === 'error') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    btn.disabled = false;
+                    btn.textContent = '🚀 Собрать каталог';
+                    status.innerHTML = '❌ Ошибка: ' + sd.error;
+                }
+            } catch (e) {
+                // Игнорировать ошибки опроса
+            }
+        }, 2000); // Опрос каждые 2 сек
+        
     } catch (err) {
-        status.textContent = '❌ Ошибка сети: ' + err.message;
-    } finally {
+        status.innerHTML = '❌ Ошибка сети: ' + err.message;
         btn.disabled = false;
         btn.textContent = '🚀 Собрать каталог';
     }
@@ -2666,43 +2723,53 @@ document.getElementById('form').onsubmit = async (e) => {
     def index():
         return INDEX_HTML
     
-    @app.route("/collect", methods=["POST"])
-    def collect():
-        if collecting["active"]:
-            return jsonify({"success": False, "error": "Уже идёт сборка, подождите"})
-        data = request.json
-        query = data.get("query", "").strip()
-        count = int(data.get("count", 40))
-        per_nom = int(data.get("per_nom", 15))
-        per_nomination = data.get("per_nomination", False)
-        vlm_filter = data.get("vlm_filter", "").strip()
-        if not query:
-            return jsonify({"success": False, "error": "Выберите номинацию"})
-        collecting["active"] = True
+    def run_job(job_id, query, count, per_nom, per_nomination):
+        """Фоновая задача сборки каталога."""
+        def update(progress, message):
+            with jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id]["progress"] = progress
+                    jobs[job_id]["message"] = message
+        
         try:
+            update(5, "Загрузка страниц конкурсов...")
             contests_data = fetch_all_contests()
+            
+            update(15, f"Поиск фото по запросу '{query}'...")
             search_max = count if per_nomination else per_nom
             photos = search_photos(query, contests_data, max_per_nomination=search_max)
+            
             if not photos:
-                return jsonify({"success": False, "error": f"Не найдено фото по запросу '{query}'"})
+                with jobs_lock:
+                    jobs[job_id] = {"status": "error", "error": f"Не найдено фото по запросу '{query}'"}
+                return
+            
+            update(25, f"Найдено {len(photos)} фото. Скачивание...")
             download_all_photos(photos)
-            if vlm_filter:
-                photos = filter_by_vlm(photos, vlm_filter)
+            
+            update(60, f"Скачано. Генерация HTML...")
             files = []
             timestamp = int(time.time())
+            
             if per_nomination:
                 by_nom = defaultdict(list)
                 for p in photos:
                     by_nom[p.get("nomination", "Другое")].append(p)
-                for nom, nom_photos in by_nom.items():
+                
+                total_noms = len(by_nom) + 1
+                for idx, (nom, nom_photos) in enumerate(by_nom.items()):
+                    progress = 60 + int((idx / total_noms) * 35)
+                    update(progress, f"Генерация: {nom} ({len(nom_photos)} фото)...")
                     safe_nom = re.sub(r'[^a-zA-Z0-9]', '_', nom)
                     output_path = os.path.join(BASE_DIR, f"gallery_{timestamp}_{safe_nom}.html")
                     generate_html_gallery(nom_photos, output_path, title=f"{nom} — 35awards", query=nom)
                     if os.path.exists(output_path):
                         size_mb = os.path.getsize(output_path) / 1024 / 1024
                         files.append({"name": f"{nom} ({len(nom_photos)} фото)", "url": f"/gallery/{os.path.basename(output_path)}", "photos": len(nom_photos), "size": f"{size_mb:.1f} МБ"})
+                
                 all_path = os.path.join(BASE_DIR, f"gallery_{timestamp}_ALL.html")
                 all_photos_trimmed = photos[:count]
+                update(95, f"Генерация общего каталога...")
                 generate_html_gallery(all_photos_trimmed, all_path, title=f"Все: {query}", query=query)
                 if os.path.exists(all_path):
                     size_mb = os.path.getsize(all_path) / 1024 / 1024
@@ -2714,12 +2781,51 @@ document.getElementById('form').onsubmit = async (e) => {
                 if os.path.exists(output_path):
                     size_mb = os.path.getsize(output_path) / 1024 / 1024
                     files.append({"name": f"Каталог ({len(photos_trimmed)} фото)", "url": f"/gallery/{os.path.basename(output_path)}", "photos": len(photos_trimmed), "size": f"{size_mb:.1f} МБ"})
-            return jsonify({"success": True, "message": f"Собрано {len(photos)} фото, создано {len(files)} каталогов", "files": files})
+            
+            update(100, f"Готово! {len(photos)} фото, {len(files)} каталогов")
+            with jobs_lock:
+                jobs[job_id] = {
+                    "status": "done",
+                    "progress": 100,
+                    "message": f"Готово! {len(photos)} фото, {len(files)} каталогов",
+                    "files": files,
+                }
         except Exception as e:
             import traceback
-            return jsonify({"success": False, "error": str(e), "trace": traceback.format_exc()[-500:]})
-        finally:
-            collecting["active"] = False
+            with jobs_lock:
+                jobs[job_id] = {
+                    "status": "error",
+                    "error": str(e),
+                    "trace": traceback.format_exc()[-500:],
+                }
+    
+    @app.route("/collect", methods=["POST"])
+    def collect():
+        data = request.json
+        query = data.get("query", "").strip()
+        count = int(data.get("count", 40))
+        per_nom = int(data.get("per_nom", 15))
+        per_nomination = data.get("per_nomination", False)
+        
+        if not query:
+            return jsonify({"success": False, "error": "Выберите номинацию"})
+        
+        # Создать задачу
+        job_id = str(uuid.uuid4())[:8]
+        with jobs_lock:
+            jobs[job_id] = {"status": "running", "progress": 0, "message": "Запуск..."}
+        
+        # Запустить в фоновом потоке
+        thread = threading.Thread(target=run_job, args=(job_id, query, count, per_nom, per_nomination), daemon=True)
+        thread.start()
+        
+        return jsonify({"success": True, "job_id": job_id})
+    
+    @app.route("/status/<job_id>")
+    def status(job_id):
+        with jobs_lock:
+            job = jobs.get(job_id, {"status": "error", "error": "Задача не найдена"})
+        return jsonify(job)
     
     @app.route("/gallery/<filename>")
     def gallery(filename):
